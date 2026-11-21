@@ -7,7 +7,12 @@
 // rooms' optima. Each room (3-4 boxes, ~6x6 floor) is solved push-optimally
 // with A* over pushes (player walks between pushes are free), an admissible
 // assignment heuristic, static dead-square pruning and 2x2 freeze pruning.
-// The per-room push sequences are then joined with hallway walks.
+// The per-room push sequences are then joined with hallway walks. A room
+// that A* cannot finish within budget gets a greedy best-first retry at the
+// same budget (a suboptimal solve still scores, a failed room scores 0);
+// if both fail, the level is left unsolved rather than burning the set's
+// remaining budget on a whole-level search, which cannot succeed where the
+// per-room searches failed.
 //
 // Determinism: budgets are counted in expanded states, never in wall time;
 // no clock, no randomness, fixed neighbour order everywhere, so two runs
@@ -20,7 +25,10 @@ const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 // Work budgets, counted in expanded states (deterministic, clock-free).
 const ASTAR_BUDGET = 400_000;
-const GREEDY_BUDGET = 200_000;
+// Greedy (best-first) fallback gets the same budget as A*: it is the last
+// chance at a valid, if suboptimal, room solution, and a suboptimal solve
+// still earns 500*P*/pushes where a failed room earns 0 for the level.
+const GREEDY_BUDGET = 400_000;
 const GLOBAL_BUDGET = 4_000_000;
 
 let globalExpansions = 0;
@@ -252,10 +260,17 @@ function pushSearch(w, h, wall, floorPlus, roomFloor, goals, startBoxes, startPl
     return frozen;
   };
 
+  // State key: boxes + player packed in base (w*h), one digit per cell.
+  // Base 256 would collide if a board ever held more than 256 cells; the
+  // generator's boards are at most 15x17=255, but base (w*h) is injective
+  // for any board size whose key stays under 2^53, so the key can never
+  // silently merge two different states. Only equality is ever tested on
+  // the key (heap order uses f/h/seq), so the search order is unchanged.
+  const BASE = w * h;
   const packKey = (boxes, player) => {
     let k = player;
-    for (let i = n - 1; i >= 0; i--) k = k * 256 + boxes[i];
-    for (let i = n; i < 4; i++) k = k * 256 + 255;
+    for (let i = n - 1; i >= 0; i--) k = k * BASE + boxes[i];
+    for (let i = n; i < 4; i++) k = k * BASE + 0;
     return k;
   };
 
@@ -531,8 +546,15 @@ function solveLevel(level) {
   if (dec) {
     const solved = solveByRooms(level, dec);
     if (solved !== null) return solved;
+    // Decomposition succeeded but a room failed: a whole-level search over
+    // 8-16 boxes is the product of the rooms' state spaces and cannot
+    // succeed where the per-room searches failed, so do not burn the
+    // remaining global budget (and wall time) on it. Return '' for this
+    // level rather than risking the whole set on a hopeless search.
+    return '';
   }
-  // Fallback: one push search over the whole level.
+  // No decomposition: the layout does not match the expected hallway+rooms
+  // shape, so a whole-level search is the only chance.
   const floorPlus = new Uint8Array(w * h);
   const roomFloor = new Uint8Array(w * h);
   for (let i = 0; i < w * h; i++) if (!wall[i]) { floorPlus[i] = 1; roomFloor[i] = 1; }
